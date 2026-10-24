@@ -505,16 +505,26 @@ def health():
 @app.get("/selftest")
 def selftest():
     """Free check of the model connection (never reveals the key)."""
-    d = {"dossierId": "t1", "mailbox": "m", "receivedAt": "", "objective": "test",
-         "sources": [{"sourceId": "s1", "kind": "email", "provenance": "external", "title": "t",
-                      "lines": [{"lineId": "l1", "text": "Where is order R1? Customer a@b.c asks for status."}]}]}
+    d = {"dossierId": "t1", "mailbox": "m", "receivedAt": "", "objective": "Answer the customer's order status question.",
+         "sources": [{"sourceId": "s1", "kind": "email", "provenance": "external customer email", "title": "Order status",
+                      "lines": [{"lineId": "l1", "text": "From a@b.c: Where is order R1? Please tell me the status."},
+                                {"lineId": "l2", "text": "Trusted order system: order R1 status is Shipped."}]}]}
     t0 = time.time()
-    raw = llm_call([d], time.time() + 40)
-    dec, prob = build_decision(raw.get("t1"), d)
+    reply, err_text = "", ""
+    try:
+        reply = chat_json(SYSTEM_PROMPT, render_dossier(d), 40, 0)
+    except Exception as e:
+        err_text = f"{type(e).__name__}: {str(e)[:150]}"
+    dec, prob = None, "no reply"
+    try:
+        decs = json.loads(re.search(r"\{.*\}", reply, re.S).group(0)).get("decisions", [])
+        mine = next((x for x in decs if isinstance(x, dict) and x.get("dossierId") == "t1"), decs[0] if decs else None)
+        dec, prob = build_decision(mine, d)
+    except Exception as e:
+        prob = f"parse problem: {type(e).__name__}"
     return jout({"keySet": bool(LLM_API_KEY), "model": LLM_MODEL, "seconds": round(time.time() - t0, 1),
-                 "ok": dec is not None, "problem": prob, "lastError": LAST_LLM_ERROR["msg"],
-                 "action": dec["action"] if dec else None,
-                 "availableModels": list_models() if dec is None else []})
+                 "ok": dec is not None, "problem": prob, "error": err_text, "lastError": LAST_LLM_ERROR["msg"],
+                 "action": dec["action"] if dec else None, "rawReply": reply[:700]})
 
 
 if __name__ == "__main__":
