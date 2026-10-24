@@ -37,6 +37,7 @@ ALL_ACTIONS = ["create_draft", "update_internal_record", "send_approved_notice",
 NO_ACTION_REASONS = ["ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"]
 CALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{12,128}$")
 
+LAST_LLM_ERROR = {"msg": ""}
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
@@ -195,33 +196,81 @@ def render_dossier(d):
     return "\n".join(out)
 
 
+GEMINI_BASE = os.environ.get("GEMINI_NATIVE_BASE", "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+NATIVE = "generativelanguage.googleapis.com" in LLM_BASE_URL and os.environ.get("LLM_NATIVE", "1") != "0"
+THINK = os.environ.get("LLM_THINKING", "512")
+
+
+def chat_json(system, user, timeout, attempt=0):
+    """Return the model's reply text (JSON). Uses Gemini's native API for Google keys, else OpenAI-compatible."""
+    if NATIVE:
+        gc = {"temperature": 0, "responseMimeType": "application/json"}
+        if THINK != "" and attempt == 0:
+            gc["thinkingConfig"] = {"thinkingBudget": int(THINK)}
+        body = {"systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": user}]}], "generationConfig": gc}
+        url = f"{GEMINI_BASE}/models/{LLM_MODEL.replace('models/', '')}:generateContent"
+        headers = {"Content-Type": "application/json", "x-goog-api-key": LLM_API_KEY}
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+        parts = data["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    payload = {"model": LLM_MODEL, "temperature": 0,
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+               "response_format": {"type": "json_object"}}
+    req = urllib.request.Request(LLM_BASE_URL + "/chat/completions", data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + LLM_API_KEY})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())["choices"][0]["message"]["content"]
+
+
+def list_models():
+    """IDs of models this key can use (never reveals the key)."""
+    if not LLM_API_KEY:
+        return []
+    try:
+        if NATIVE:
+            req = urllib.request.Request(GEMINI_BASE + "/models", headers={"x-goog-api-key": LLM_API_KEY})
+        else:
+            req = urllib.request.Request(LLM_BASE_URL + "/models", headers={"Authorization": "Bearer " + LLM_API_KEY})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+        ids = [m.get("id") or m.get("name", "") for m in data.get("data", data.get("models", []))]
+        return [i.replace("models/", "") for i in ids if "flash" in i or "pro" in i][:40]
+    except Exception as e:
+        return [f"could not list models: {type(e).__name__}: {str(e)[:100]}"]
+
+
+
 def llm_call(chunk, deadline, hint=None):
     """chunk: list of dossiers -> {dossierId: raw_decision}"""
     if not LLM_API_KEY:
+        LAST_LLM_ERROR["msg"] = "LLM_API_KEY is not set"
         return {}
-    for attempt in range(2):
+    for attempt in range(3):
         remaining = deadline - time.time()
         if remaining < 6:
             break
         user = "\n\n".join(render_dossier(d) for d in chunk)
         if hint:
             user += "\n\nPREVIOUS ATTEMPT PROBLEMS (fix them):\n" + hint
-        payload = {"model": LLM_MODEL, "temperature": 0,
-                   "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
-                   "response_format": {"type": "json_object"}}
-        if REASONING and attempt == 0:
-            payload["reasoning_effort"] = REASONING
-        req = urllib.request.Request(LLM_BASE_URL + "/chat/completions", data=json.dumps(payload).encode(),
-                                     headers={"Content-Type": "application/json", "Authorization": "Bearer " + LLM_API_KEY})
         try:
-            with urllib.request.urlopen(req, timeout=max(5, min(remaining - 2, 48))) as r:
-                content = json.loads(r.read())["choices"][0]["message"]["content"]
+            content = chat_json(SYSTEM_PROMPT, user, max(5, min(remaining - 2, 48)), attempt)
             m = re.search(r"\{.*\}", content, re.S)
             decs = json.loads(m.group(0)).get("decisions", [])
             return {d["dossierId"]: d for d in decs if isinstance(d, dict) and isinstance(d.get("dossierId"), str)}
         except urllib.error.HTTPError as e:
-            time.sleep(2 if e.code == 429 else 0.5)
-        except Exception:
+            try:
+                detail = e.read().decode("utf-8", "replace")[:160]
+            except Exception:
+                detail = ""
+            LAST_LLM_ERROR["msg"] = f"LLM HTTP {e.code}: {detail}"
+            app.logger.warning(LAST_LLM_ERROR["msg"])
+            time.sleep(4 if e.code == 429 else 0.5)
+        except Exception as e:
+            LAST_LLM_ERROR["msg"] = f"LLM error: {type(e).__name__}: {str(e)[:150]}"
+            app.logger.warning(LAST_LLM_ERROR["msg"])
             time.sleep(0.5)
     return {}
 
@@ -323,7 +372,7 @@ def decide_all(dossiers, deadline):
 
     chunks = [todo[i:i + CHUNK] for i in range(0, len(todo), CHUNK)]
     if chunks:
-        with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as ex:
+        with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as ex:
             for results in ex.map(run, chunks):
                 apply(results)
         retry = [d for d in todo if fps[d["dossierId"]] not in cache]
@@ -357,7 +406,7 @@ def do_propose(body):
         allowed = set(body["allowedActions"])
         cache, fps, missing = decide_all(dossiers, deadline)
         if missing:
-            raise Bad(503, "Decisions are not ready; retry shortly.")
+            raise Bad(503, "Decisions are not ready; retry shortly. " + LAST_LLM_ERROR["msg"])
         proposals = []
         for d in dossiers:
             dec = cache[fps[d["dossierId"]]]
@@ -451,6 +500,21 @@ def endpoint(p):
 @app.get("/")
 def health():
     return jout({"ok": True, "profile": PROFILE})
+
+
+@app.get("/selftest")
+def selftest():
+    """Free check of the model connection (never reveals the key)."""
+    d = {"dossierId": "t1", "mailbox": "m", "receivedAt": "", "objective": "test",
+         "sources": [{"sourceId": "s1", "kind": "email", "provenance": "external", "title": "t",
+                      "lines": [{"lineId": "l1", "text": "Where is order R1? Customer a@b.c asks for status."}]}]}
+    t0 = time.time()
+    raw = llm_call([d], time.time() + 40)
+    dec, prob = build_decision(raw.get("t1"), d)
+    return jout({"keySet": bool(LLM_API_KEY), "model": LLM_MODEL, "seconds": round(time.time() - t0, 1),
+                 "ok": dec is not None, "problem": prob, "lastError": LAST_LLM_ERROR["msg"],
+                 "action": dec["action"] if dec else None,
+                 "availableModels": list_models() if dec is None else []})
 
 
 if __name__ == "__main__":
